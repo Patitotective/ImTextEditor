@@ -1,4 +1,4 @@
-import std/[monotimes, sequtils, unicode, tables, math, re]
+import std/[monotimes, sequtils, strutils, unicode, bitops, tables, math, re]
 import nimgl/imgui
 
 type
@@ -49,7 +49,7 @@ type
   Palette* = array[PaletteIndex.high, uint32] # FIXME
 
   Glyph* = object
-    c*: Rune
+    c*: string
     colorIndex*: PaletteIndex
     comment*: bool
     multiLineComment*: bool
@@ -124,6 +124,29 @@ type
     startTime*: MonoTime
 
     lastClick*: float
+
+proc isAlphaNum*(c: Rune): bool = 
+  c.isAlpha() or c in Digits
+
+proc calcTextSizeA(
+  self: ptr ImFont, 
+  size: float32, 
+  max_width: float32, 
+  wrap_width: float32, 
+  text_begin: cstring, 
+  text_end: cstring = nil,
+  remaining: ptr cstring = nil
+): ImVec2 = 
+  calcTextSizeANonUDT(
+    result.addr, 
+    self,  
+    size, 
+    max_width, 
+    wrap_width, 
+    text_begin, 
+    text_end,
+    remaining
+  )
 
 proc coord*(line, col: Positive): Coord = 
   Coord(line: line, col: col)
@@ -290,16 +313,16 @@ proc getActualCursorCoordinates*(self: TextEditor): Coord =
 proc advance(self: var TextEditor, coord: var Coord) = 
   if coord.line < self.lines.len
     let line = self.lines[coord.line]
-    var cIndex = self.getCharacterIndex(coord)
+    var cindex = self.getCharacterIndex(coord)
 
-    if cIndex < line.len: # FIXME
-      let delta = line[cIndex].c.runeLen
-      cIndex = min(cIndex + delta, line.high)
+    if cindex < line.len: # FIXME
+      let delta = line[cindex].c.runeLen
+      cindex = min(cindex + delta, line.high)
     else:
       inc coord.line
-      cIndex = 0
+      cindex = 0
 
-    coord.col = getCharacterColumn(coord.line, cIndex)
+    coord.col = getCharacterColumn(coord.line, cindex)
 
 proc deleteRange(self: var TextEditor, startCoord, endCoord: Coord) = 
   # FIXME Check if begin/end are the same as 0/high
@@ -336,7 +359,7 @@ proc deleteRange(self: var TextEditor, startCoord, endCoord: Coord) =
 
   self.textChanged = true
 
-proc insertTextAt(self: var TextEditor, where: var Coord, value: string): int = 
+proc insertTextAt(self: var TextEditor, where: var Coord, value: string): int = # FIXME
   assert not self.readOnly
 
   var cindex = self.getCharacterIndex(where)
@@ -350,8 +373,10 @@ proc insertTextAt(self: var TextEditor, where: var Coord, value: string): int =
       if cindex < self.lines[where.line].len:
         var newLine = self.insertLine(where.line + 1)
         var line = self.lines[where.line]
+        
         newLine.insert(line[cindex..^1], 0)
         line.delete(cindex..^1)
+
       else:
         self.insertLine(where.line + 1)
 
@@ -366,10 +391,229 @@ proc insertTextAt(self: var TextEditor, where: var Coord, value: string): int =
       var d = value.runeLen
       while d > 0 and value != '\0':
         line.insert(glyph(value, PaletteIndex.Default), cindex)
-        inc cIndex
+        inc cindex
         dec value
 
       inc where.col
 
     self.textChanged = true
+
+proc addUndo*(self: var TextEditor, rec: UndoRecord) = 
+  assert not self.readOnly
+
+  #printf("AddUndo: (@%d.%d) +\'%s' [%d.%d .. %d.%d], -\'%s', [%d.%d .. %d.%d] (@%d.%d)\n",
+  #  aValue.mBefore.mCursorPosition.line, aValue.mBefore.mCursorPosition.mColumn,
+  #  aValue.mAdded.c_str(), aValue.mAddedStart.line, aValue.mAddedStart.mColumn, aValue.mAddedEnd.line, aValue.mAddedEnd.mColumn,
+  #  aValue.mRemoved.c_str(), aValue.mRemovedStart.line, aValue.mRemovedStart.mColumn, aValue.mRemovedEnd.line, aValue.mRemovedEnd.mColumn,
+  #  aValue.mAfter.mCursorPosition.line, aValue.mAfter.mCursorPosition.mColumn
+  #  )
+
+  self.undoBuffer.add rec
+  inc self.undoIndex
+
+proc screenPosToCoordinates*(self: TextEditor, pos: ImVec2): Coord = 
+  let origin = igGetCursorScreenPos()
+  let local = pos - origin # FIXME
+
+  let lineNo = max(0, int floor(local.y / self.charAdvance.y))
+  var columnCoord = 0
+
+  if lineNo >= 0 and lineNo < self.lines.len:
+    let line = self.lines[lineNo]
+
+    var columnIndex = 0
+    var columnX = 0f
+
+    while columnIndex < line.len:
+      var columnWidth = 0f
+
+      if line[columnIndex].c == "\t":
+        let spaceSize = igGetFont().calcTextSizeA(igGetFontlen, float.high, -1f, " ").x
+        let oldX = columnX
+        let newColumnX = (1f + floor((1f + columnX) / (self.tabSize * spaceSize))) * (self.tabSize * spaceSize)
+        columnWidth = newColumnX - oldX
+        if (self.textStart + columnX + columnWidth * 0f) > local.x: # FIXME
+          break
+
+        columnX = newColumnX
+        columnCoord = (columnCoord / self.tabSize) * self.tabSize + self.tabSize
+        inc columnIndex
+      
+      else:
+        let buf = newString(7)
+        let d = line[columnIndex].c.runeLen
+        var i = 0
+
+        while i < 6 and d > 0:
+          buf[i] = line[columnIndex].c
+          dec d
+          inc i
+          inc columnIndex
+
+        buf[i] = '\0'
+        columnWidth = igGetFont().calcTextSizeA(igGetFontlen, float.high, -1f, cstring buf).x
+        if (self.textStart + columnX + columnWidth * 0.5f) > local.x:
+          break
+
+        columnX += columnWidth
+        inc columnCoord
+
+  result = self.sanitizeCoordinates(coord(lineNo, columnCoord))
+
+proc findWordStart*(self: TextEditor, at: Coord): Coord = 
+  if at.line >= self.lines.len:
+    return at
+
+  let line = self.lines[at.line]
+  var cindex = self.getCharacterIndex(at)
+
+  if cindex >= line.len:
+    return at
+
+  while cindex > 0 and line[cindex].c.isSpace()
+    dec cindex
+
+  let cstart = line[cindex].colorIndex
+  while cindex > 0:
+    let c = line[cindex].c
+
+    if bitand(c, 0xC0) != 0x80: # not UTF code sequence 10xxxxxx # FIXME
+      if c <= 32 and c.isSpace():
+        inc cindex
+
+      if cstart != line[size_t(cindex - 1)].colorIndex: # FIXME size_t(cindex - 1)
+        break
+
+    dec cindex
+
+  result = coord(at.line, self.getCharacterColumn(at.line, cindex))
+
+proc findWordEnd*(self: TextEditor, at: Coord): Coord = 
+  if at.line >= self.lines.len:
+    return at
+
+  let line = self.lines[at.line]
+  var cindex = self.getCharacterIndex(at)
+
+  if cindex >= line.len:
+    return at
+
+  let prevspace = line[cindex].c.isSpace()
+  let cstart = line[cindex].colorIndex
+  while cindex < line.len:
+    let c = line[cindex].c
+    let d = c.runeLen
+    if cstart != line[cindex].colorIndex:
+      break
+
+    if prevspace != c.isSpace():
+      if c.isSpace():
+        while cindex < line.len and line[cindex].c.isSpace():
+          inc cindex
+      break
+    
+    cindex += d
+
+  result = coord(at.line, self.getCharacterColumn(at.line, cindex))
+
+proc findNextWord*(self: TextEditor, at: Coord): Coord = 
+
+  if at.line >= self.lines.len:
+    return at
+
+  var at = at
+  # skip to the next non-word character
+  var cindex = self.getCharacterIndex(at)
+  var isword = false
+  var skip = false
+
+  let line = lines[at.line]
+
+  if cindex < line.len:
+    isword = line[cindex].c.isAlphaNum()
+    skip = isword
+
+  while not isword or skip:
+    if at.line >= self.lines.len:
+      let l = max(0, self.lines.high)
+      return coord(l, self.getLineMaxColumn(l))
+
+    if cindex < line.len:
+      isword = line[cindex].c.isAlphaNum()
+
+      if isword and not skip:
+        return coord(at.line, self.getCharacterColumn(at.line, cindex))
+
+      if not isword:
+        skip = false
+
+      inc cindex
+    
+    else:
+      cindex = 0
+      inc at.line
+      skip = false
+      isword = false
+    
+  result = at
+
+proc getCharacterIndex*(self: TextEditor, at: Coord): int
+  if at.line >= self.lines.len:
+    return -1
+
+  let line = self.lines[at.line]
+  var c = 0
+  var result = 0
+  while result < line.len and c < at.col:
+    if line[result].c == "\t"
+      c = (c / self.tabSize) * self.tabSize + self.tabSize
+    else:
+      inc c
+
+    result += line[result].c.runeLen
+
+proc getCharacterColumn*(self: TextEditor, aLine: int, aIndex: int): int
+  if aLine >= self.lines.len:
+    return 0
+
+  let line = self.lines[aLine]
+  var result = 0
+  var i = 0
+
+  while i < aIndex and i < line.len:
+    let c = line[i].c
+    i += c.runeLen
+    if c == "\t":
+      result = (result / self.tabSize) * self.tabSize + self.tabSize
+    else:
+      inc result
+
+proc getLineCharacterCount(self: TextEditor, aLine: int): int
+  if aLine >= self.lines.len:
+    return 0
+
+  let line = self.lines[aLine]
+
+  var i = 0
+  while i < line.len:
+    i += line[i].c.runeLen
+    inc result
+
+int TextEditor::GetLineMaxColumn(int aLine) const
+
+  if (aLine >= self.lines.len)
+    return 0
+  auto& line = self.lines[aLine]
+  int col = 0
+  for (unsigned i = 0 i < line.len )
+  
+    auto c = line[i].c
+    if (c == "\t")
+      col = (col / self.tabSize) * self.tabSize + self.tabSize
+    else
+      col++
+    i += UTF8CharLength(c)
+  
+  return col
+
 
