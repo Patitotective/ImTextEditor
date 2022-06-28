@@ -1,1 +1,0 @@
-firstLine.insert(firstLine.end(), lastLine.begin(), lastLine.end());
