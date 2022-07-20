@@ -2,7 +2,7 @@ import std/strformat
 import nimgl/[opengl, glfw]
 import nimgl/imgui, nimgl/imgui/[impl_opengl, impl_glfw]
 
-import texteditor, utils
+import src/imtexteditor
 
 proc main() =
   doAssert glfwInit()
@@ -13,30 +13,32 @@ proc main() =
   glfwWindowHint(GLFWOpenglProfile, GLFW_OPENGL_CORE_PROFILE)
   glfwWindowHint(GLFWResizable, GLFW_TRUE)
 
-  var w: GLFWWindow = glfwCreateWindow(1280, 720)
+  var w: GLFWWindow = glfwCreateWindow(700, 720)
   if w == nil:
     quit(-1)
 
   w.makeContextCurrent()
 
+
   doAssert glInit()
 
   let context = igCreateContext()
-  #let io = igGetIO()
+  let io = igGetIO()
+  io.fonts.addFontDefault()
 
   doAssert igGlfwInitForOpenGL(w, true)
   doAssert igOpenGL3Init()
 
-  igStyleColorsCherry()
-
+  let editorFont = io.fonts.addFontFromFileTTF("assets/UbuntuMono-Regular.ttf", 13)
   var lastClipboard = ""
   var editor = initTextEditor(
-    # blinkMs = 0, 
+    # palette = getMonokaiPalette(), 
+    languageDef = langDefTest(), 
     breakpoints = @[24, 27], 
     errorMarkers = @[(6, "Example error here:\nInclude file not found: \"TextEditor.h\""), (41, "Another example error")], 
   )
-  editor.languageDef.autoIndentation = true
 
+  
   while not w.windowShouldClose:
     glfwPollEvents()
 
@@ -44,8 +46,7 @@ proc main() =
     igGlfwNewFrame()
     igNewFrame()
 
-    let cpos = editor.getCursorPos()
-    igSetNextWindowSize(igVec2(800, 600), ImGuiCond.FirstUseEver)
+    let cpos = editor.getCursorCoord()
     if igBegin("Text Editor Demo", flags = ImGuiWindowFlags.MenuBar):
       if igBeginMenuBar():
         if igBeginMenu("File"):
@@ -76,7 +77,7 @@ proc main() =
           if igMenuItem("Cut", "Ctrl-X", enabled = not ro and editor.hasSelection()):
             editor.cut()
           if igMenuItem("Delete", "Del", enabled = not ro and editor.hasSelection()):
-            editor.delete(false)
+            editor.delete()
           if igMenuItem("Paste", "Ctrl-V", enabled = not ro and not igGetClipboardText().isNil):
             editor.paste()
 
@@ -89,18 +90,24 @@ proc main() =
 
         if igBeginMenu("View"):
           if igMenuItem("Dark palette"):
-            editor.palette = getDarkPalette()
+            editor.setPalette(getDarkPalette())
           if igMenuItem("Light palette"):
-            editor.palette = getLightPalette()
+            editor.setPalette(getLightPalette())
           if igMenuItem("Retro blue palette"):
-            editor.palette = getRetroBluePalette()
-          
+            editor.setPalette(getRetroBluePalette())
+          if igMenuItem("Monokai palette"):
+            editor.setPalette(getMonokaiPalette())
+
           igEndMenu()
         igEndMenuBar()
 
     igText("Application average %.3f ms/frame (%.1f FPS)", 1000f / igGetIO().framerate, igGetIO().framerate)
     igText(cstring &"{cpos.line + 1}:{cpos.col + 1} | {editor.languageDef.name} | file.nim")
+    
+    editorFont.igPushFont()
     editor.render("TextEditor", igVec2(600, 600), true)
+    igPopFont()
+
     igEnd()
     # End simple window
 
